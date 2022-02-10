@@ -1,4 +1,4 @@
-# Predict prices for Airbnb rentals in NYC using Gradient Boost and NLP
+# Predict prices for Airbnb rentals in NYC using Gradient Boost and NLP in R
 
 The project was hosted on Kaggle. For this project, we were given a listing of over 40,000 Airbnb rentals in New York City. The goal of this competition was to predict the price for a rentals using 90 variables on the property, host, and past reviews. 
 
