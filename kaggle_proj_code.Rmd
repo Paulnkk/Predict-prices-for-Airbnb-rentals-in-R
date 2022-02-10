@@ -1,0 +1,328 @@
+---
+title: "paul_kaggle"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+#library(tm)
+library(irlba)
+library(dplyr)
+library(NLP)
+library(tidyverse)
+library(tidytext)
+library(Matrix)
+library (xgboost)
+library(caret)
+library(vtreat)
+library(ranger)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r read_in_data}
+traindata <- read.delim("analysisData.csv", header=TRUE, sep = ",", dec = ".")
+testdata <- read.delim("scoringData.csv", header=TRUE, sep = ",", dec = ".")
+target <- traindata$price
+traindata <- subset(traindata, select = -c(price))
+data <- rbind(traindata, testdata)
+```
+
+```{r outlier cleaning}
+#Clean outliers by first, third quantile and IQR
+quart <- function(x) {
+  x <- sort(x)
+  n <- length(x)
+  m <- (n+1)/2
+  if (floor(m) != m) {
+    l <- m-1/2; u <- m+1/2
+  } else {
+    l <- m-1; u <- m+1
+  }
+  c(Q1=median(x[1:l]), Q3=median(x[u:n]))
+}
+
+rep_outlier <- function(x){
+    q_vec = quart(x)
+    q1 = q_vec['Q1']
+    q3 = q_vec['Q3']
+    IQR = q3 - q1
+    x[ x < q1 - 1.5 * IQR ] <- q1 - 1.5 * IQR
+    x[ x > q3 + 1.5 * IQR ] <- q3 + 1.5 * IQR
+    return(x)
+}
+```
+
+```{r text_column_transformation_definition, echo=FALSE}
+
+transform_text_column <- function(column, tol) {
+  # computes a bag of words on a text column & reduces dimensionality to n dimensions through SVD    
+  # by using IRLBA https://cran.r-project.org/web/packages/irlba/irlba.pdf
+  removeUrl <- function(x) {gsub("http://[[:alnum:]./]*", "", x)}
+  nt_to_not <- function(x) {gsub("n\\'t", " not", x)}
+  m_to_am <- function(x) {gsub("i\\'m", " am", x)}
+  re_to_are <- function(x) {gsub("\\'re", " are", x)}
+  strip_accent <- function(x) {gsub("\\'", " ", x)}
+  strip_accent2 <- function(x) {gsub("\\ˆ", " ", x)}
+  strip_accent3 <- function(x) {gsub("\\<", "", x)}
+  strip_accent4 <- function(x) {gsub("\\>", "", x)}
+  remove_short <- function(x) {gsub('\\b\\w{1,2}\\b', "", x)}
+  myStopWords <- stopwords(kind="en")
+  myStopWords <- setdiff(myStopWords, c("not", "few", "more", "most", "below", "very"))
+  
+  text_corpus <- VectorSource(paste0("RandomWord ", column))
+  text_corpus <- Corpus(text_corpus)
+  text_corpus <- tm_map(text_corpus, content_transformer(tolower))
+  text_corpus <- tm_map(text_corpus, content_transformer(removeUrl))
+  text_corpus <- tm_map(text_corpus, content_transformer(nt_to_not))
+  text_corpus <- tm_map(text_corpus, content_transformer(m_to_am))
+  text_corpus <- tm_map(text_corpus, content_transformer(re_to_are))
+  text_corpus <- tm_map(text_corpus, content_transformer(strip_accent))
+  text_corpus <- tm_map(text_corpus, content_transformer(strip_accent2))
+  text_corpus <- tm_map(text_corpus, content_transformer(strip_accent3))
+  text_corpus <- tm_map(text_corpus, content_transformer(strip_accent4))
+  text_corpus <- tm_map(text_corpus, content_transformer(remove_short))
+  text_corpus <- tm_map(text_corpus, content_transformer(removePunctuation))
+  text_corpus <- tm_map(text_corpus, content_transformer(removeNumbers))
+  text_corpus <- tm_map(text_corpus, content_transformer(stripWhitespace))
+  text_corpus <- tm_map(text_corpus, removeWords, myStopWords)
+  
+  text_corpus <- tm_map(text_corpus, stemDocument)
+  
+  corpus <- data.frame(text = sapply(text_corpus, as.character), stringsAsFactors = FALSE)
+  
+  df <- data.frame(corpus)
+  colnames(df) <- c("corpus")
+  df$ind <- seq(1,nrow(df))
+  
+  unigram_list <- df %>%
+  unnest_tokens(word, "corpus") %>%  
+  count(word) %>%
+  filter(n >= 40) %>% # filter for words used 20 or more times
+  pull(word)
+
+  unigram_list <- unigram_list[!is.na(unigram_list)]
+  
+  unigram_features <- df %>%
+  unnest_tokens(word, "corpus") %>%
+  filter(word %in% unigram_list) %>%
+  count(ind, word) %>%                 
+  spread(word, n) %>%                 
+  map_df(replace_na, 0)
+  
+  res <- irlba::prcomp_irlba(as(as.matrix(unigram_features), "sparseMatrix"), n=1, center=FALSE, scale=TRUE, x = tol=tol)
+  
+  return(data.frame(res$x))
+}
+```
+
+```{r split into different data types and transform}
+nums <- unlist(lapply(data, is.numeric))
+numeric_data <- data[, nums]
+non_numeric_data <- data[, !nums]
+text_data <- non_numeric_data[, 1:10]
+text_data$amenities <- non_numeric_data$amenities
+categorical_data <- non_numeric_data[,11:ncol(non_numeric_data)]
+categorical_data <- subset(categorical_data, select = -c(amenities))
+
+#transform categorical data
+categorical_data$host_response_rate <- as.numeric(gsub("[\\%,]", "", categorical_data$host_response_rate))
+categorical_data$host_response_rate <- replace_na(categorical_data$host_response_rate, median(categorical_data$host_response_rate, na.rm=TRUE))
+categorical_data$host_acceptance_rate <- as.numeric(gsub("[\\%,]", "", categorical_data$host_acceptance_rate))
+categorical_data$host_acceptance_rate <- replace_na(categorical_data$host_acceptance_rate, median(categorical_data$host_acceptance_rate, na.rm=TRUE))
+categorical_data$host_since <- as.numeric(as.Date(categorical_data$host_since, "%Y-%m-%d"))
+categorical_data$first_review <- as.numeric(as.Date(categorical_data$first_review, "%Y-%m-%d"))
+categorical_data$last_review <- as.numeric(as.Date(categorical_data$last_review, "%Y-%m-%d"))
+
+numeric_data2 <- categorical_data[,c("host_response_rate", "host_acceptance_rate", "host_since", "first_review", "last_review")]
+categorical_data <- subset(categorical_data, select = -c(host_response_rate, host_acceptance_rate, host_since, first_review, last_review))
+
+mode<-function(x){which.max(tabulate(x))}
+categorical_data <- categorical_data %>% mutate_all(function (x) addNA(x)) %>% mutate_if(is.character, as.factor) %>% mutate_all(function (x) as.numeric(x))
+numeric_data <- cbind(numeric_data, numeric_data2)
+
+numeric_data <- numeric_data %>% mutate_all(~ifelse(is.na(.x), median(.x, na.rm = TRUE), .x))
+numeric_data$host_total_listings_count <- NULL
+```
+
+```{r text_column_transformation_execution, include=FALSE}
+transformed_texts <- readRDS("text_components.rds")
+
+# uncomment below to rerun computation
+#transformed_texts <- data.frame(text_data[,1])
+#for(col in names(text_data)){
+#  transformed_cols <- transform_text_column(text_data[[col]], 0.1)
+#  transformed_texts <- cbind(transformed_texts, transformed_cols)
+#}
+#transformed_texts <- transformed_texts[,2:ncol(transformed_texts)]
+```
+
+```{r save_components, include=FALSE}
+#saveRDS(transformed_texts, "text_components.rds")
+```
+
+```{r concatenate_dataset, include=FALSE}
+full_data <- cbind(numeric_data, categorical_data, transformed_texts)
+full_data$interaction <- NULL
+full_data$weekly_price <- NULL
+full_data$availability_30 <- NULL
+full_data$availability_60 <-NULL
+full_data$requires_license <- NULL
+full_data$text_data...1 <- NULL
+full_data$require_guest_profile_picture <- NULL
+
+full_train <- full_data[1:nrow(traindata),]
+full_train$price <- target
+full_train$price <- NULL
+full_test <- full_data[(nrow(traindata)+1):nrow(full_data),]
+
+id_col <- full_test$id
+full_test$id <- NULL
+full_train$id <- NULL
+
+```
+
+```{r concatenate_dataset, include=FALSE}
+full_train_matrix = as.matrix(full_train)
+full_train = data.frame(full_train)
+
+start.time <- Sys.time()
+# Create empty lists
+
+lowest_error_list = list()
+parameters_list = list()
+
+dtrain = xgb.DMatrix(data = full_train_matrix, label = full_train$price)
+
+#Create 10,000 rows with random hyperparameters
+set.seed(20)
+for (iter in 1:10000){
+  param <- list(booster = "gbtree",
+    objective = "reg:squarederror",
+    max_depth = sample(3:10, 1),
+    eta = runif(1, .01, .3),
+    subsample = runif(1, .7, 1),
+    colsample_bytree = runif(1, .6, 1),
+    min_child_weight = sample(0:10, 1)
+    )
+  parameters <- as.data.frame(param)
+  parameters_list[[iter]] <- parameters
+}
+
+# Create object that contains all randomly created hyperparameters
+parameters_df = do.call(rbind, parameters_list)
+# Use randomly created parameters to create 10,000 XGBoost-models
+for (row in 1:nrow(parameters_df)){
+  set.seed(20)
+  mdcv <- xgb.train(data = dtrain,
+    booster = "gbtree",
+    objective = "reg:squarederror",
+    max_depth = parameters_df$max_depth[row],
+    eta = parameters_df$eta[row],
+    subsample = parameters_df$subsample[row],
+    colsample_bytree = parameters_df$colsample_bytree[row],
+    min_child_weight = parameters_df$min_child_weight[row],
+    nrounds= 300,
+    eval_metric = "error",
+    early_stopping_rounds= 30,
+    print_every_n = 100,
+    watchlist = list(train= dtrain)
+    )
+  lowest_error <- as.data.frame(1 - min(mdcv$evaluation_log$val_error))
+  lowest_error_list[[row]] <- lowest_error
+    }
+# Create object that contains all accuracy's
+lowest_error_df = do.call(rbind, lowest_error_list)
+
+# Bind columns of accuracy values and random hyperparameter values
+randomsearch = cbind(lowest_error_df, parameters_df)
+
+# Quickly display highest accuracy
+max(randomsearch$`1 - min(mdcv$evaluation_log$val_error)`)
+
+# Stop time and calculate difference
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+
+write_csv(randomsearch, "data/randomsearch.csv")
+```
+
+```{r gradboost, include=FALSE}
+#full_test_matrix = xgb.DMatrix(as.matrix(full_test), label = as.numeric(full_test$price))
+#label_num = as.numeric(target)
+#full_test_df = data.frame(full_test)
+
+idx <- match(colnames(full_train), colnames(full_test))
+full_test_match <- full_test[,idx]
+
+varslist = colnames(full_train)
+
+treatplan = designTreatmentsZ(full_train, varslist, verbose = FALSE)
+full_train.treat <- prepare(treatplan, full_train,  varRestriction = varslist)
+
+varslist_test = colnames(full_test)
+
+treatplan = designTreatmentsZ(full_test_match, varslist, verbose = FALSE)
+full_test.treat <- prepare(treatplan, full_test_match,  varRestriction = varslist_test)
+
+#Determine optimal number of trees
+cv <- xgb.cv(data = as.matrix(full_train.treat), 
+            label = target,
+            nrounds = 300,
+            nfold = 8,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 10,
+            verbose = 0)
+
+#Get the evaluation log for optimal number of trees
+elog <- as.data.frame(cv$evaluation_log)
+min_trees = which.min(elog$train_rmse_mean)
+
+
+#Run xgboost
+model_xgb <- xgboost(data = as.matrix(full_train.treat), # training data as matrix
+                   label = target,  # column of outcomes
+                   nrounds = min_trees,       # number of trees to build
+                   objective = 'reg:squarederror', # objective
+                   eta = 0.1,
+                   depth = 10,
+                   verbose = 0  # silent
+)
+#Make predictions
+pred <- predict(model_xgb, newdata = as.matrix(full_test.treat))
+```
+
+```{r grid search random forest, include=FALSE}
+#Grid search for random forest model with random parameters
+#num.trees = c(20000, 40000)
+#min.node.size = c(2, 5, 10, 12)
+#max.depth = c(15 ,20, 30, 60)
+#num.random.splits = c(3, 5, 7)
+#for(i in num.trees){
+  #for (j in min.node.size){
+    #for(k in max.depth){
+      #for (l in num.random.splits){
+        #r <- ranger(price~., full_train,num.trees = i,min.node.size = j,max.depth = k,num.random.splits = l)
+      #}
+    #}
+  #}
+#}
+
+#r <- ranger(price~., full_train, num.trees = 3000, min.node.size = 2, max.depth = 20, num.random.splits = 4)
+```
+
+#scoringData = read.csv('scoringData.csv')
+#pred = predict(r, full_test)$predictions
+#cat('Predicion error:', sqrt(r$prediction.error))
+
+submissionFile = data.frame(id = id_col, price = pred)
+write.csv(submissionFile, 'sample_submission_xgboost_3.csv',row.names = F)
+```
