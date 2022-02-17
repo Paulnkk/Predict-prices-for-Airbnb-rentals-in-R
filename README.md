@@ -6,4 +6,4 @@ I transformed features which consisted of text data into 3-dimensional numerical
 
 My implementation includes two models: Random Forest and Gradient Boost. The corresponding parameters were determined by hyperparameter tuning and the Gradient Boost model generated the lowest RMSE (59.25).
 
-I reached the top 6% on the leaderboard (out of ~ 1000 participants). 
+I reached the top 6% on the leaderboard (out of ~ 800 participants). 
